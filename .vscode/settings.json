@@ -1,0 +1,30 @@
+{
+    "sonarlint.connectedMode.project": {
+        "connectionId": "haritharandunu",
+        "projectKey": "HarithaRandunu_214129X_CM4371_Assignment"
+    },
+    "sonarlint.analysisExcludesStandalone": "**/.venv/**,**/.venv/Lib/**,**/.venv/Lib/site-packages/**,**/Lib/site-packages/**,**/site-packages/**,**/.vscode/extensions/**,**/typeshed-fallback/**,**/AppData/Local/Python/**,**/*.pyi",
+    "sonarlint.analyzerProperties": {
+        "sonar.exclusions": "**/.venv/**,**/.venv/Lib/**,**/.venv/Lib/site-packages/**,**/Lib/site-packages/**,**/site-packages/**,**/.vscode/extensions/**,**/typeshed-fallback/**,**/AppData/Local/Python/**,**/*.pyi",
+        "sonar.test.exclusions": "**/.venv/**,**/.venv/Lib/**,**/.venv/Lib/site-packages/**,**/Lib/site-packages/**,**/site-packages/**"
+    },
+    "files.exclude": {
+        "**/.venv/**": true,
+        "**/.venv/Lib/**": true,
+        "**/site-packages/**": true,
+        "**/.vscode/extensions/**": true
+    },
+    "files.watcherExclude": {
+        "**/.venv/**": true,
+        "**/.venv/Lib/**": true,
+        "**/site-packages/**": true
+    },
+    "search.exclude": {
+        "**/.venv/**": true,
+        "**/.venv/Lib/**": true,
+        "**/site-packages/**": true,
+        "**/.vscode/extensions/**": true
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python-envs.pythonProjects": []
+}
