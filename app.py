@@ -298,12 +298,15 @@ def _capture_current_device_data(token: str) -> dict | None:
 
 def _telemetry_endpoint_base(telemetry_port: int) -> str:
     host = os.getenv("STREAMLIT_SERVER_ADDRESS", "localhost")
+    scheme = os.getenv("STREAMLIT_PUBLIC_SCHEME", "http").strip().lower()
+    if scheme not in {"https", "http"}:
+        scheme = "http"
     if host in {"0.0.0.0", "127.0.0.1", "localhost"}:
         try:
             host = socket.gethostbyname(socket.gethostname())
         except OSError:
             host = "localhost"
-    return f"http://{host}:{telemetry_port}"
+    return urlunsplit((scheme, f"{host}:{telemetry_port}", "", "", ""))
 
 
 def _render_client_probe(token: str, endpoint_base: str) -> None:
