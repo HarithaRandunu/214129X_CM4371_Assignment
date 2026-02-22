@@ -110,7 +110,7 @@ A Streamlit application is included in `app.py` with:
 - confidence visualization and tips,
 - model performance dashboards,
 - XAI visualizations,
-- device-side telemetry panel (host + browser API context).
+- device-side telemetry panel using the **current browser device** (with optional host fallback).
 
 ---
 
@@ -129,7 +129,7 @@ A Streamlit application is included in `app.py` with:
 
 ### 1) Install dependencies
 ```bash
-pip install streamlit plotly scikit-learn pandas numpy matplotlib seaborn psutil
+pip install streamlit plotly scikit-learn pandas numpy matplotlib seaborn psutil qrcode[pil]
 ```
 
 ### 2) Run ML pipeline
@@ -151,7 +151,7 @@ py -m scripts.run_checks
 
 What they do:
 - `py -m scripts.run_pipeline` → runs `ml_pipeline_complete.py`
-- `py -m scripts.run_app` → runs `streamlit run app.py`
+- `py -m scripts.run_app` → launches Streamlit and prints a terminal QR code for phone access
 - `py -m scripts.run_checks` → runs syntax compile checks, then runs pipeline
 
 ### 5) Windows `.cmd` shortcuts (shell-specific)
