@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import io
 import platform
+import socket
 import time
 import warnings
 
@@ -54,6 +56,11 @@ from project_config import (
 )
 
 warnings.filterwarnings("ignore")
+
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -103,6 +110,29 @@ def render_dataset_links() -> None:
         for name, url in DATASET_LINKS.items()
     )
     st.markdown(f"<ul>{links_html}</ul>", unsafe_allow_html=True)
+
+
+def _get_app_urls() -> tuple[str, str]:
+    port = int(st.get_option("server.port") or 8501)
+    local_url = f"http://localhost:{port}"
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        ip = "localhost"
+    network_url = f"http://{ip}:{port}"
+    return local_url, network_url
+
+
+def _build_qr_png(url: str) -> bytes | None:
+    if qrcode is None:
+        return None
+    qr = qrcode.QRCode(border=1, box_size=6)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 # ---------------------------------------------------------------------------
 # Page config and CSS
@@ -690,6 +720,17 @@ def render_sidebar() -> str:
 
         st.markdown("---")
         st.caption("Algorithm: Gaussian Naive Bayes\n\nDatasets: DS1 · DS2 · DS3")
+
+        st.markdown("---")
+        st.markdown("**QR Access**")
+        local_url, network_url = _get_app_urls()
+        qr_png = _build_qr_png(network_url)
+        st.caption(f"Local: {local_url}")
+        st.caption(f"Network: {network_url}")
+        if qr_png:
+            st.image(qr_png, caption="Scan to open on phone", width=140)
+        else:
+            st.caption("Install `qrcode[pil]` to display QR in UI.")
 
     return st.session_state.page
 
