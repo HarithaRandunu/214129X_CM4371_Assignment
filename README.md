@@ -1,6 +1,6 @@
 # Digital Wellbeing Stress Predictor
 
-MSc AI — Machine Learning and Pattern Recognition Assignment  
+Machine Learning and Pattern Recognition Assignment  
 Student: **214129X (Malalpola MLHR)**
 
 This project predicts a user's **digital stress level** (`Low`, `Medium`, `High`) by combining three domains:
