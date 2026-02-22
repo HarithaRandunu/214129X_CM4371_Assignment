@@ -78,7 +78,36 @@ Generated into `outputs/`:
 
 ---
 
-## 4) Explainability & Interpretation (XAI)
+## 4) Web App Features (Streamlit UI)
+
+The interactive web application provides:
+
+- **Overview Page**: Dataset info, model performance metrics, cross-validation results
+- **Stress Predictor**: Input digital habits → get ML-powered stress risk prediction with probabilities
+- **Device Predictions**: Real-time browser telemetry with battery drain and network quality predictions
+- **Project Report**: Complete ML pipeline explanation, XAI interpretability analysis, bias assessment
+
+### Automatic Device Detection (NEW)
+
+The app **automatically detects** whether you're using a mobile device or desktop:
+
+- **Mobile Layout** (iOS/Android): Stacked columns, tab-based inputs, touch-friendly UI
+- **Desktop Layout** (laptop/PC): Side-by-side columns, inline inputs, higher chart density
+
+**How it works:**
+- JavaScript captures browser User-Agent on first page load
+- Pattern matching detects mobile keywords (`iphone`, `ipad`, `android`, `mobile`, etc.)
+- Each browser session gets independent layout based on their device type
+- **No manual toggle required** — automatically optimizes UI for each connecting device
+
+**Multi-device support:**  
+When laptop and mobile phone connect simultaneously, each gets the appropriate layout automatically.
+
+See [DEVICE_DETECTION.md](DEVICE_DETECTION.md) for technical implementation details.
+
+---
+
+## 5) Explainability & Interpretation (XAI)
 
 Implemented methods:
 - **Permutation Feature Importance**
@@ -92,7 +121,7 @@ What this provides:
 
 ---
 
-## 5) Critical Discussion
+## 6) Critical Discussion
 
 Key considerations covered in code/report workflow:
 - model assumptions (feature independence in GNB),
