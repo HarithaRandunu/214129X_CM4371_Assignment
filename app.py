@@ -157,6 +157,18 @@ st.markdown(f"""
     }}
     .dcard .dval {{ font-size: 1.5rem; font-weight: 700; }}
     .dcard .dlbl {{ font-size: 0.78rem; color: {UI_THEME['muted_text']}; }}
+
+    /* Mobile responsiveness */
+        @media (max-width: 768px) {{
+            .sec-head {{ font-size: 1.05rem !important; margin: 0.2rem 0 0.6rem !important; }}
+            .kpi {{ padding: 0.75rem 0.8rem !important; }}
+            .kpi .val {{ font-size: 1.35rem !important; }}
+            .result {{ font-size: 1.1rem !important; padding: 0.9rem !important; }}
+            .dcard {{ padding: 0.7rem !important; }}
+            .dcard .dval {{ font-size: 1.2rem !important; }}
+            section[data-testid="stSidebar"] button {{ margin: 0.15rem 0 !important; }}
+            div[data-testid="stMetric"] {{ padding: 0.25rem 0 !important; }}
+        }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -645,10 +657,17 @@ def _donut(labels: list, values: list, title: str) -> go.Figure:
 def render_sidebar() -> str:
     if "page" not in st.session_state:
         st.session_state.page = PAGE_OVERVIEW
+    if "mobile_layout" not in st.session_state:
+        st.session_state.mobile_layout = False
 
     with st.sidebar:
         st.markdown("### Digital Wellbeing Predictor")
         st.markdown("214129X — Malalpola MLHR")
+        st.session_state.mobile_layout = st.toggle(
+            "Mobile layout (iOS / Android)",
+            value=st.session_state.mobile_layout,
+            help="Enable a phone-friendly stacked UI with lighter chart density.",
+        )
         st.markdown("---")
         st.markdown("**Navigation**")
 
@@ -842,10 +861,18 @@ def page_stress_predictor(p: dict) -> None:
     tab_pred, tab_perf, tab_xai = st.tabs(["My Prediction", "Model Performance", "XAI Explanation"])
 
     with tab_pred:
-        left_col, right_col = st.columns([1, 1], gap="large")
+        mobile_layout = bool(st.session_state.get("mobile_layout", False))
+        if mobile_layout:
+            mobile_inputs_tab, mobile_results_tab = st.tabs(["Inputs", "Results"])
+            input_parent = mobile_inputs_tab
+            input_height = "content"
+        else:
+            left_col, right_col = st.columns([1, 1], gap="large")
+            input_parent = left_col
+            input_height = 760
 
-        with left_col:
-            with st.container(height=760):
+        with input_parent:
+            with st.container(height=input_height):
                 st.markdown("**Parameters**")
                 st.markdown("**Demographics**")
                 age = st.slider("Age", 13, 70, 22)
@@ -889,8 +916,15 @@ def page_stress_predictor(p: dict) -> None:
         col = CLASS_COLOURS[pred_cls]
         bg = CLASS_BG[pred_cls]
 
-        with right_col:
-            with st.container(height=760):
+        if mobile_layout:
+            result_parent = mobile_results_tab
+            result_height = "content"
+        else:
+            result_parent = right_col
+            result_height = 760
+
+        with result_parent:
+            with st.container(height=result_height):
                 st.markdown("**Result**")
                 st.markdown(
                     f'<div class="result" style="background:{bg};color:{col};border:2px solid {col}">'
@@ -1023,67 +1057,90 @@ def page_stress_predictor(p: dict) -> None:
 # Page: Device Predictions
 # ---------------------------------------------------------------------------
 
-def _render_device_cards(dd: dict, bp: dict, np_: dict, sp: dict) -> None:
-    p1, p2, p3 = st.columns(3)
+def _render_battery_panel(dd: dict, bp: dict) -> None:
+    st.markdown(f'<div class="sec-head">{ICON["battery"]} Battery</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="dcard">'
+        f'<div class="dval" style="color:{bp["colour"]}">{bp["status"]}</div>'
+        f'<div class="dlbl">Battery health status</div></div>',
+        unsafe_allow_html=True,
+    )
+    if dd["batt_pct"]:
+        st.plotly_chart(_gauge(dd["batt_pct"], "Battery level (%)", bp["colour"]), width="stretch")
+        if dd["batt_secs"] and dd["batt_secs"] > 0:
+            st.metric("Est. time remaining", f"{dd['batt_secs'] / 3600:.1f} hrs")
+    else:
+        st.info("No battery detected — this is a desktop machine.")
+    st.markdown(f"**Advice:** {bp['tip']}")
+    st.caption(f"Drain index: {bp['drain_idx']} | "
+               f"{'Est. hrs left: ' + str(bp['hrs_left']) if bp['hrs_left'] else 'Plugged in'}")
 
-    with p1:
-        st.markdown(f'<div class="sec-head">{ICON["battery"]} Battery</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="dcard">'
-            f'<div class="dval" style="color:{bp["colour"]}">{bp["status"]}</div>'
-            f'<div class="dlbl">Battery health status</div></div>',
-            unsafe_allow_html=True,
-        )
-        if dd["batt_pct"]:
-            st.plotly_chart(_gauge(dd["batt_pct"], "Battery level (%)", bp["colour"]), width="stretch")
-            if dd["batt_secs"] and dd["batt_secs"] > 0:
-                st.metric("Est. time remaining", f"{dd['batt_secs'] / 3600:.1f} hrs")
-        else:
-            st.info("No battery detected — this is a desktop machine.")
-        st.markdown(f"**Advice:** {bp['tip']}")
-        st.caption(f"Drain index: {bp['drain_idx']} | "
-                   f"{'Est. hrs left: ' + str(bp['hrs_left']) if bp['hrs_left'] else 'Plugged in'}")
 
-    with p2:
-        st.markdown(f'<div class="sec-head">{ICON["wifi"]} Network</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="dcard">'
-            f'<div class="dval" style="color:{np_["colour"]}">{np_["category"]} usage</div>'
-            f'<div class="dlbl">Total: {np_["total"]} GB since boot</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.plotly_chart(
-            _gauge(min(np_["total"] * 10, 100), "Network load index", np_["colour"]),
-            width="stretch",
-        )
+def _render_network_panel(np_: dict) -> None:
+    st.markdown(f'<div class="sec-head">{ICON["wifi"]} Network</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="dcard">'
+        f'<div class="dval" style="color:{np_["colour"]}">{np_["category"]} usage</div>'
+        f'<div class="dlbl">Total: {np_["total"]} GB since boot</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(
+        _gauge(min(np_["total"] * 10, 100), "Network load index", np_["colour"]),
+        width="stretch",
+    )
+    breakdown_values = [float(np_["social"]), float(np_["stream"]), float(np_["other"])]
+    breakdown_total = sum(breakdown_values)
+    valid_breakdown = bool(np.isfinite(np.array(breakdown_values)).all() and breakdown_total > 0)
+
+    if valid_breakdown:
         st.plotly_chart(
             _donut(["Social / Browsing", "Streaming / Downloads", "Other"],
-                   [np_["social"], np_["stream"], np_["other"]],
+                   breakdown_values,
                    "Estimated data breakdown"),
             width="stretch",
         )
-        st.markdown(f"**Advice:** {np_['tip']}")
+    else:
+        st.info("Estimated data breakdown is unavailable until network receive data is detected.")
+    st.markdown(f"**Advice:** {np_['tip']}")
+
+
+def _render_system_panel(dd: dict, sp: dict) -> None:
+    st.markdown(f'<div class="sec-head">{ICON["cpu"]} Screen & System</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="dcard">'
+        f'<div class="dval" style="color:{sp["colour"]}">{sp["status"]} load</div>'
+        f'<div class="dlbl">System load index: {sp["load"]}%</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(_gauge(dd["cpu_pct"], "CPU usage (%)", sp["colour"]), width="stretch")
+    if dd["ram_pct"] > 80:
+        ram_col = "#c0392b"
+    elif dd["ram_pct"] > 50:
+        ram_col = "#e67e22"
+    else:
+        ram_col = "#27ae60"
+    st.plotly_chart(_gauge(dd["ram_pct"], "RAM usage (%)", ram_col), width="stretch")
+    st.markdown(f"**Advice:** {sp['tip']}")
+
+def _render_device_cards(dd: dict, bp: dict, np_: dict, sp: dict) -> None:
+    mobile_layout = bool(st.session_state.get("mobile_layout", False))
+
+    if mobile_layout:
+        _render_battery_panel(dd, bp)
+        _render_network_panel(np_)
+        _render_system_panel(dd, sp)
+        return
+
+    p1, p2, p3 = st.columns(3)
+
+    with p1:
+        _render_battery_panel(dd, bp)
+
+    with p2:
+        _render_network_panel(np_)
 
     with p3:
-        st.markdown(f'<div class="sec-head">{ICON["cpu"]} Screen & System</div>',
-                    unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="dcard">'
-            f'<div class="dval" style="color:{sp["colour"]}">{sp["status"]} load</div>'
-            f'<div class="dlbl">System load index: {sp["load"]}%</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.plotly_chart(_gauge(dd["cpu_pct"], "CPU usage (%)", sp["colour"]),
-                        width="stretch")
-        if dd["ram_pct"] > 80:
-            ram_col = "#c0392b"
-        elif dd["ram_pct"] > 50:
-            ram_col = "#e67e22"
-        else:
-            ram_col = "#27ae60"
-        st.plotly_chart(_gauge(dd["ram_pct"], "RAM usage (%)", ram_col),
-                        width="stretch")
-        st.markdown(f"**Advice:** {sp['tip']}")
+        _render_system_panel(dd, sp)
 
 
 def _render_device_relevance(dd: dict, np_: dict) -> None:
