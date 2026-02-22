@@ -1004,56 +1004,164 @@ def _donut(labels: list, values: list, title: str) -> go.Figure:
     return fig
 
 # ---------------------------------------------------------------------------
+# Device Detection (Auto-detect Mobile vs Desktop)
+# ---------------------------------------------------------------------------
+# Automatically detects device type from browser viewport width and User-Agent.
+# Each connecting device (laptop, phone, tablet) gets detected independently.
+# Mobile layout applies stacked columns and tab-based UI for iOS/Android.
+# Desktop layout uses side-by-side columns for better screen utilization.
+# ---------------------------------------------------------------------------
+
+def _detect_mobile_from_user_agent(user_agent: str) -> bool:
+    """
+    Detect if device is mobile based on User-Agent string.
+    
+    Args:
+        user_agent: Browser User-Agent string from navigator.userAgent
+        
+    Returns:
+        True if mobile device (iOS/Android/tablet), False for desktop
+        
+    Examples:
+        iPhone User-Agent: "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 ..."
+        Android: "Mozilla/5.0 (Linux; Android 11; Pixel 5) ..."
+        Desktop: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+    """
+    if not user_agent:
+        return False
+    
+    ua_lower = user_agent.lower()
+    mobile_keywords = [
+        "iphone", "ipad", "ipod", "android", 
+        "mobile", "phone", "tablet", "webos"
+    ]
+    return any(keyword in ua_lower for keyword in mobile_keywords)
+
+
+def _auto_detect_device_layout() -> None:
+    """
+    Auto-detect device type and set mobile_layout in session state.
+    
+    Uses viewport width detection since Streamlit components.html() doesn't
+    support direct return values. Checks query params set by JavaScript probe.
+    """
+    if "mobile_layout" not in st.session_state:
+        # Check if JavaScript detection already set query param
+        try:
+            # Streamlit 1.12+ uses st.query_params
+            if hasattr(st, 'query_params'):
+                params = st.query_params
+            else:
+                # Fallback for older versions
+                params = st.experimental_get_query_params()
+            
+            if "mobile_detected" in params:
+                # JavaScript already detected - use that value
+                st.session_state.mobile_layout = params["mobile_detected"][0] == "1"
+                st.session_state._detection_complete = True
+                return
+        except Exception:
+            pass
+        
+        # First load - inject detection JavaScript
+        st.session_state.mobile_layout = False  # Default to desktop
+        st.session_state._detection_complete = False
+        
+        # Inject JavaScript to detect mobile and set query param
+        components.html(
+            """
+            <script>
+            (function() {
+                // Detect mobile using User-Agent and viewport width
+                const ua = navigator.userAgent || "";
+                const mobileUA = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+                const narrowViewport = window.innerWidth < 768;
+                const isMobile = mobileUA || narrowViewport;
+                
+                // Check if we already have the query param
+                const url = new URL(window.location.href);
+                const params = url.searchParams;
+                
+                if (!params.has('mobile_detected')) {
+                    // Add detection result and reload
+                    params.set('mobile_detected', isMobile ? '1' : '0');
+                    window.location.href = url.toString();
+                }
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sidebar navigation
 # ---------------------------------------------------------------------------
+
+def _render_device_detection_status() -> None:
+    """Display auto-detected device type in sidebar."""
+    if "mobile_layout" in st.session_state:
+        if st.session_state.get("_detection_complete", False):
+            device_type = "📱 Mobile" if st.session_state.mobile_layout else "💻 Desktop"
+            st.caption(f"Device: {device_type}")
+        else:
+            st.caption("Device: Detecting...")
+    else:
+        st.caption("Device: Loading...")
+
+
+def _render_navigation_buttons() -> None:
+    """Render navigation buttons and handle page switching."""
+    labels = {
+        PAGE_OVERVIEW: PAGE_OVERVIEW,
+        PAGE_STRESS_PREDICTOR: PAGE_STRESS_PREDICTOR,
+        PAGE_DEVICE_PREDICTIONS: PAGE_DEVICE_PREDICTIONS,
+        PAGE_PROJECT_REPORT: PAGE_PROJECT_REPORT,
+    }
+    for pg, label in labels.items():
+        active = st.session_state.page == pg
+        if st.button(
+            label,
+            key=f"_nav_{pg}",
+            type="primary" if active else "secondary",
+            width="stretch",
+        ):
+            st.session_state.page = pg
+            st.rerun()
+
+
+def _render_qr_access() -> None:
+    """Render QR code access section in sidebar."""
+    local_url, network_url = _get_app_urls()
+    qr_png = _build_qr_png(network_url)
+    st.caption(f"Local: {local_url}")
+    st.caption(f"Network: {network_url}")
+    if qr_png:
+        st.image(qr_png, caption="Scan to open on phone", width=140)
+    else:
+        st.caption("Install `qrcode[pil]` to display QR in UI.")
+
 
 def render_sidebar() -> str:
     if "page" not in st.session_state:
         st.session_state.page = PAGE_OVERVIEW
-    if "mobile_layout" not in st.session_state:
-        st.session_state.mobile_layout = False
 
     with st.sidebar:
         st.markdown("### Digital Wellbeing Predictor")
         st.markdown("214129X — Malalpola MLHR")
-        st.session_state.mobile_layout = st.toggle(
-            "Mobile layout (iOS / Android)",
-            value=st.session_state.mobile_layout,
-            help="Enable a phone-friendly stacked UI with lighter chart density.",
-        )
+        
+        _render_device_detection_status()
+        
         st.markdown("---")
         st.markdown("**Navigation**")
-
-        labels = {
-            PAGE_OVERVIEW: PAGE_OVERVIEW,
-            PAGE_STRESS_PREDICTOR: PAGE_STRESS_PREDICTOR,
-            PAGE_DEVICE_PREDICTIONS: PAGE_DEVICE_PREDICTIONS,
-            PAGE_PROJECT_REPORT: PAGE_PROJECT_REPORT,
-        }
-        for pg, label in labels.items():
-            active = st.session_state.page == pg
-            if st.button(
-                label,
-                key=f"_nav_{pg}",
-                type="primary" if active else "secondary",
-                width="stretch",
-            ):
-                st.session_state.page = pg
-                st.rerun()
+        _render_navigation_buttons()
 
         st.markdown("---")
         st.caption("Algorithm: Gaussian Naive Bayes\n\nDatasets: DS1 · DS2 · DS3")
 
         st.markdown("---")
         st.markdown("**QR Access**")
-        local_url, network_url = _get_app_urls()
-        qr_png = _build_qr_png(network_url)
-        st.caption(f"Local: {local_url}")
-        st.caption(f"Network: {network_url}")
-        if qr_png:
-            st.image(qr_png, caption="Scan to open on phone", width=140)
-        else:
-            st.caption("Install `qrcode[pil]` to display QR in UI.")
+        _render_qr_access()
 
     return st.session_state.page
 
@@ -1774,6 +1882,9 @@ def main() -> None:
     if "_loading_until" not in st.session_state:
         st.session_state._loading_until = time.time() + MIN_PAGE_LOADER_SECONDS
         st.session_state._loading_message = "Loading application..."
+    
+    # Auto-detect device type before rendering UI
+    _auto_detect_device_layout()
 
     now = time.time()
     loading_until = st.session_state.get("_loading_until", 0.0)
