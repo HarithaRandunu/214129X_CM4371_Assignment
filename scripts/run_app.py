@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -13,6 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 def _resolve_app_url() -> str:
     host = os.getenv("STREAMLIT_SERVER_ADDRESS", "localhost")
     port = os.getenv("STREAMLIT_SERVER_PORT", "8501")
+    scheme = os.getenv("STREAMLIT_PUBLIC_SCHEME", "http").strip().lower()
+    if scheme not in {"https", "http"}:
+        scheme = "http"
 
     if host in {"0.0.0.0", "127.0.0.1", "localhost"}:
         try:
@@ -20,7 +24,7 @@ def _resolve_app_url() -> str:
         except OSError:
             host = "localhost"
 
-    return f"http://{host}:{port}"
+    return urlunsplit((scheme, f"{host}:{port}", "", "", ""))
 
 
 def _print_terminal_qr(url: str) -> None:

@@ -7,10 +7,16 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import platform
 import socket
+import threading
 import time
+import uuid
 import warnings
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlunsplit
 
 import numpy as np
 import pandas as pd
@@ -114,12 +120,16 @@ def render_dataset_links() -> None:
 
 def _get_app_urls() -> tuple[str, str]:
     port = int(st.get_option("server.port") or 8501)
-    local_url = f"http://localhost:{port}"
+    scheme = os.getenv("STREAMLIT_PUBLIC_SCHEME", "http").strip().lower()
+    if scheme not in {"https", "http"}:
+        scheme = "http"
+
+    local_url = urlunsplit((scheme, f"localhost:{port}", "", "", ""))
     try:
         ip = socket.gethostbyname(socket.gethostname())
     except OSError:
         ip = "localhost"
-    network_url = f"http://{ip}:{port}"
+    network_url = urlunsplit((scheme, f"{ip}:{port}", "", "", ""))
     return local_url, network_url
 
 
@@ -133,6 +143,268 @@ def _build_qr_png(url: str) -> bytes | None:
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+_CLIENT_TELEMETRY: dict[str, dict] = {}
+_CLIENT_TELEMETRY_LOCK = threading.Lock()
+_CLIENT_TELEMETRY_PORT: int | None = None
+
+
+def _extract_battery_fields(battery: dict) -> tuple[float | None, bool | None, int | None]:
+    battery_level = battery.get("level")
+    batt_pct = round(float(battery_level) * 100, 1) if battery_level is not None else None
+    batt_plugged = battery.get("charging") if isinstance(battery.get("charging"), bool) else None
+
+    discharging_time = battery.get("dischargingTime")
+    batt_secs = None
+    if isinstance(discharging_time, (int, float)) and discharging_time > 0 and discharging_time != float("inf"):
+        batt_secs = int(discharging_time)
+    return batt_pct, batt_plugged, batt_secs
+
+
+def _extract_memory_fields(payload: dict, perf: dict) -> tuple[float, float, float | None]:
+    js_heap_total = perf.get("totalJSHeapSize")
+    js_heap_used = perf.get("usedJSHeapSize")
+
+    ram_pct = None
+    if isinstance(js_heap_total, (int, float)) and js_heap_total > 0 and isinstance(js_heap_used, (int, float)):
+        ram_pct = round(max(0, min(100, (js_heap_used / js_heap_total) * 100)), 1)
+
+    dev_mem = payload.get("deviceMemory")
+    ram_total_gb = float(dev_mem) if isinstance(dev_mem, (int, float)) else 8.0
+    if ram_pct is None:
+        ram_pct = 45.0
+    ram_used_gb = round(ram_total_gb * (ram_pct / 100), 1)
+    return float(ram_pct), ram_used_gb, ram_total_gb
+
+
+def _estimate_cpu_load(ram_pct: float, cores: int | None, net_downlink_mbps: float | None) -> float:
+    estimated_load = 30.0 + (ram_pct * 0.35)
+    if isinstance(net_downlink_mbps, (int, float)):
+        estimated_load += min(20.0, net_downlink_mbps * 1.2)
+    if isinstance(cores, int) and cores > 0:
+        estimated_load += max(0, 8 - min(cores, 8)) * 1.8
+    return round(max(5.0, min(95.0, estimated_load)), 1)
+
+
+def _normalise_client_payload(payload: dict) -> dict:
+    battery = payload.get("battery") or {}
+    perf = payload.get("performance") or {}
+    net = payload.get("network") or {}
+
+    batt_pct, batt_plugged, batt_secs = _extract_battery_fields(battery)
+    ram_pct, ram_used_gb, ram_total_gb = _extract_memory_fields(payload, perf)
+
+    cores = payload.get("hardwareConcurrency")
+    net_downlink_mbps = net.get("downlink") if isinstance(net.get("downlink"), (int, float)) else None
+    cpu_pct = _estimate_cpu_load(ram_pct, cores if isinstance(cores, int) else None, net_downlink_mbps)
+
+    return {
+    "source": "client",
+    "captured_at": time.time(),
+    "batt_pct": batt_pct,
+    "batt_plugged": batt_plugged,
+    "batt_secs": batt_secs,
+    "cpu_pct": cpu_pct,
+    "cpu_cores": int(cores) if isinstance(cores, int) else None,
+    "ram_pct": float(ram_pct),
+    "ram_used_gb": ram_used_gb,
+    "ram_total_gb": ram_total_gb,
+    "net_sent_gb": 0.0,
+    "net_recv_gb": 0.0,
+    "net_downlink_mbps": float(net_downlink_mbps) if isinstance(net_downlink_mbps, (int, float)) else None,
+    "net_effective_type": net.get("effectiveType") if isinstance(net.get("effectiveType"), str) else None,
+    "os": payload.get("platform") or "Browser device",
+    "machine": payload.get("userAgent") or "Unknown",
+    "browser_memory_supported": bool(payload.get("hasPerformanceMemory", False)),
+    }
+
+
+def _start_client_telemetry_server() -> int:
+    global _CLIENT_TELEMETRY_PORT
+    if _CLIENT_TELEMETRY_PORT is not None:
+        return _CLIENT_TELEMETRY_PORT
+
+    class _TelemetryHandler(BaseHTTPRequestHandler):
+        def _set_headers(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self._set_headers()
+            self.end_headers()
+
+        def do_POST(self) -> None:
+            if self.path != "/device-telemetry":
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                data = json.loads(body)
+                token = str(data.get("token", "")).strip()
+                payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+
+                if not token:
+                    raise ValueError("missing token")
+
+                normalized = _normalise_client_payload(payload)
+                with _CLIENT_TELEMETRY_LOCK:
+                    _CLIENT_TELEMETRY[token] = normalized
+
+                self.send_response(200)
+                self._set_headers()
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            except Exception:
+                self.send_response(400)
+                self._set_headers()
+                self.end_headers()
+                self.wfile.write(b'{"ok":false}')
+
+        def log_message(self, format, *args):
+            return
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("0.0.0.0", 0))
+    port = int(probe.getsockname()[1])
+    probe.close()
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), _TelemetryHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _CLIENT_TELEMETRY_PORT = port
+    return port
+
+
+def _consume_client_telemetry(token: str) -> dict | None:
+    with _CLIENT_TELEMETRY_LOCK:
+        return _CLIENT_TELEMETRY.get(token)
+
+
+def _capture_current_device_data(token: str) -> dict | None:
+    current = None
+    for _ in range(8):
+        current = _consume_client_telemetry(token)
+        if current is not None:
+            return current
+        time.sleep(0.25)
+    return None
+
+
+def _telemetry_endpoint_base(telemetry_port: int) -> str:
+    host = os.getenv("STREAMLIT_SERVER_ADDRESS", "localhost")
+    if host in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        try:
+            host = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            host = "localhost"
+    return f"http://{host}:{telemetry_port}"
+
+
+def _render_client_probe(token: str, endpoint_base: str) -> None:
+    components.html(
+        f"""
+<div id="client-data" style="font-family:system-ui,sans-serif;font-size:0.85rem;
+    background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-top:0.4rem">
+    <strong>Browser-reported device data (your current device)</strong>
+    <div id="probe-status" style="margin-top:0.45rem;color:#8b949e">Collecting device telemetry...</div>
+    <div id="probe-batt" style="margin-top:0.3rem;color:#8b949e"></div>
+    <div id="probe-net"  style="margin-top:0.3rem;color:#8b949e"></div>
+    <div id="probe-mem"  style="margin-top:0.3rem;color:#8b949e"></div>
+    <p style="margin-top:0.7rem;color:#555;font-size:0.78rem">
+        Click <strong>Use my current device data</strong> after this shows telemetry synced.
+    </p>
+</div>
+<script>
+(async function() {{
+    const statusEl = document.getElementById("probe-status");
+    const battEl = document.getElementById("probe-batt");
+    const netEl = document.getElementById("probe-net");
+    const memEl = document.getElementById("probe-mem");
+    const endpoint = "{endpoint_base}/device-telemetry";
+
+    function safeSet(el, html) {{ if (el) el.innerHTML = html; }}
+
+    async function collect() {{
+        let batt = {{}};
+        if (navigator.getBattery) {{
+            try {{
+                const b = await navigator.getBattery();
+                batt = {{
+                    level: b.level,
+                    charging: b.charging,
+                    dischargingTime: b.dischargingTime,
+                }};
+            }} catch (e) {{ batt = {{}}; }}
+        }}
+
+        const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        const perfMem = performance.memory || null;
+
+        const payload = {{
+            userAgent: navigator.userAgent || null,
+            platform: navigator.platform || null,
+            hardwareConcurrency: navigator.hardwareConcurrency || null,
+            deviceMemory: navigator.deviceMemory || null,
+            hasPerformanceMemory: !!perfMem,
+            performance: perfMem ? {{
+                totalJSHeapSize: perfMem.totalJSHeapSize,
+                usedJSHeapSize: perfMem.usedJSHeapSize,
+            }} : {{}},
+            network: conn ? {{
+                downlink: conn.downlink,
+                effectiveType: conn.effectiveType,
+                saveData: conn.saveData,
+            }} : {{}},
+            battery: batt,
+            collectedAt: Date.now(),
+        }};
+
+        try {{
+            await fetch(endpoint, {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ token: "{token}", payload }}),
+            }});
+            safeSet(statusEl, "<span style='color:#27ae60'>Telemetry synced from this device.</span>");
+        }} catch (e) {{
+            safeSet(statusEl, "<span style='color:#c0392b'>Unable to sync device telemetry.</span>");
+        }}
+
+        if (batt.level != null) {{
+            const pct = Math.round(batt.level * 100);
+            safeSet(battEl, `<span style='color:#27ae60'>Battery:</span> ${{pct}}% | ${{batt.charging ? "Charging" : "Discharging"}}`);
+        }} else {{
+            safeSet(battEl, "<span style='color:#555'>Battery API unavailable in this browser.</span>");
+        }}
+
+        if (conn) {{
+            safeSet(netEl, `<span style='color:#1f6feb'>Network:</span> ${{conn.effectiveType || "unknown"}} | Downlink: ${{conn.downlink ?? "?"}} Mbps`);
+        }} else {{
+            safeSet(netEl, "<span style='color:#555'>Network API unavailable in this browser.</span>");
+        }}
+
+        if (perfMem) {{
+            const used = Math.round(perfMem.usedJSHeapSize / 1048576);
+            const total = Math.round(perfMem.totalJSHeapSize / 1048576);
+            safeSet(memEl, `<span style='color:#e67e22'>JS Heap:</span> ${{used}} MB / ${{total}} MB`);
+        }} else {{
+            safeSet(memEl, "<span style='color:#555'>Performance memory API unavailable.</span>");
+        }}
+    }}
+
+    collect();
+    setInterval(collect, 15000);
+}})();
+</script>
+""",
+    height=190,
+    )
 
 # ---------------------------------------------------------------------------
 # Page config and CSS
@@ -502,8 +774,13 @@ def collect_server_stats() -> dict:
 # Rule-based device health predictions
 def _batt_prediction(pct, plugged, cpu, ram) -> dict:
     if pct is None:
-        return {"status": "No battery", "colour": "#8b949e",
-                "tip": "Desktop machine detected — no battery present."}
+        return {
+            "status": "No battery data",
+            "colour": "#8b949e",
+            "tip": "Battery metrics are unavailable on this browser/device.",
+            "drain_idx": None,
+            "hrs_left": None,
+        }
     drain_idx = round(cpu * 0.15 + ram * 0.10, 1)
     if pct > 80:   status, col = "Excellent", "#27ae60"
     elif pct > 50: status, col = "Good",      "#2ecc71"
@@ -520,7 +797,44 @@ def _batt_prediction(pct, plugged, cpu, ram) -> dict:
             "drain_idx": drain_idx, "hrs_left": round(hrs, 1) if hrs else None}
 
 
-def _net_prediction(sent, recv) -> dict:
+def _net_prediction(dd: dict) -> dict:
+    if dd.get("source") == "client":
+        downlink = dd.get("net_downlink_mbps")
+        if downlink is None:
+            return {
+                "category": "Unknown",
+                "colour": "#8b949e",
+                "total": 0.0,
+                "social": 0.0,
+                "stream": 0.0,
+                "other": 0.0,
+                "tip": "Browser blocked network throughput metrics for this device.",
+                "metric_label": "Downlink unavailable",
+                "show_breakdown": False,
+            }
+
+        if downlink < 2:
+            cat, col = "Light", "#27ae60"
+        elif downlink < 10:
+            cat, col = "Moderate", "#e67e22"
+        else:
+            cat, col = "Heavy", "#c0392b"
+
+        estimated_total = max(0.1, round(downlink * 0.18, 2))
+        return {
+            "category": cat,
+            "colour": col,
+            "total": estimated_total,
+            "social": round(estimated_total * 0.35, 2),
+            "stream": round(estimated_total * 0.40, 2),
+            "other": round(estimated_total * 0.25, 2),
+            "tip": "Based on browser-reported live downlink from your current device.",
+            "metric_label": f"Downlink: {downlink:.1f} Mbps",
+            "show_breakdown": True,
+        }
+
+    sent = float(dd.get("net_sent_gb", 0.0) or 0.0)
+    recv = float(dd.get("net_recv_gb", 0.0) or 0.0)
     total = sent + recv
     if total < 1:    cat, col = "Low",      "#27ae60"
     elif total < 10: cat, col = "Moderate", "#e67e22"
@@ -528,9 +842,15 @@ def _net_prediction(sent, recv) -> dict:
     tip = ("Usage is within healthy limits." if total < 5
            else "High data detected. Check for background streaming or sync tasks.")
     return {
-        "category": cat, "colour": col, "total": round(total, 2),
-        "social": round(recv * 0.35, 2), "stream": round(recv * 0.40, 2),
-        "other":  round(recv * 0.25, 2), "tip": tip,
+        "category": cat,
+        "colour": col,
+        "total": round(total, 2),
+        "social": round(recv * 0.35, 2),
+        "stream": round(recv * 0.40, 2),
+        "other": round(recv * 0.25, 2),
+        "tip": tip,
+        "metric_label": f"Total: {round(total, 2)} GB since boot",
+        "show_breakdown": True,
     }
 
 
@@ -740,70 +1060,6 @@ def go_to(page: str) -> None:
     st.session_state._loading_until = time.time() + MIN_PAGE_LOADER_SECONDS
     st.session_state.page = page
     st.rerun()
-
-# ---------------------------------------------------------------------------
-# JavaScript: collect client-side browser device data (mobile-aware)
-# ---------------------------------------------------------------------------
-
-CLIENT_JS = """
-<div id="client-data" style="font-family:system-ui,sans-serif;font-size:0.85rem;
-  background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-top:0.5rem">
-  <strong>Browser-reported device data</strong>
-  <div id="batt-info" style="margin-top:0.5rem;color:#8b949e">Checking battery...</div>
-  <div id="net-info"  style="margin-top:0.3rem;color:#8b949e">Checking network...</div>
-  <div id="mem-info"  style="margin-top:0.3rem;color:#8b949e">Checking memory...</div>
-  <p style="margin-top:0.7rem;color:#555;font-size:0.78rem">
-    This data comes from your browser (your actual device).
-    The server-side stats above reflect the machine hosting the app.
-  </p>
-</div>
-<script>
-(function() {
-  // Battery API — available in Chrome/Edge, limited in Safari/Firefox
-  if (navigator.getBattery) {
-    navigator.getBattery().then(function(b) {
-      var pct  = Math.round(b.level * 100);
-      var stat = b.charging ? "Charging" : "Discharging";
-      var mins = b.dischargingTime !== Infinity
-                   ? " | ~" + Math.round(b.dischargingTime / 60) + " min left"
-                   : "";
-      document.getElementById("batt-info").innerHTML =
-        "<span style='color:#27ae60'>Battery:</span> " + pct + "% — " + stat + mins;
-    }).catch(function() {
-      document.getElementById("batt-info").innerHTML =
-        "<span style='color:#555'>Battery API not available in this browser.</span>";
-    });
-  } else {
-    document.getElementById("batt-info").innerHTML =
-      "<span style='color:#555'>Battery API not supported (try Chrome).</span>";
-  }
-
-  // Network information API — Chrome Android / Chrome Desktop
-  if (navigator.connection) {
-    var c = navigator.connection;
-    document.getElementById("net-info").innerHTML =
-      "<span style='color:#1f6feb'>Network:</span> " +
-      (c.effectiveType || "unknown") + " | Downlink: " +
-      (c.downlink || "?") + " Mbps | Save-data: " + (c.saveData ? "yes" : "no");
-  } else {
-    document.getElementById("net-info").innerHTML =
-      "<span style='color:#555'>Network Information API not supported.</span>";
-  }
-
-  // Memory — Chrome only
-  if (performance.memory) {
-    var m = performance.memory;
-    var used  = Math.round(m.usedJSHeapSize  / 1048576);
-    var total = Math.round(m.totalJSHeapSize / 1048576);
-    document.getElementById("mem-info").innerHTML =
-      "<span style='color:#e67e22'>JS Heap:</span> " + used + " MB / " + total + " MB";
-  } else {
-    document.getElementById("mem-info").innerHTML =
-      "<span style='color:#555'>Memory API not available.</span>";
-  }
-})();
-</script>
-"""
 
 # ---------------------------------------------------------------------------
 # Page: Overview
@@ -1106,15 +1362,22 @@ def _render_battery_panel(dd: dict, bp: dict) -> None:
         f'<div class="dlbl">Battery health status</div></div>',
         unsafe_allow_html=True,
     )
-    if dd["batt_pct"]:
+    if dd.get("batt_pct") is not None:
         st.plotly_chart(_gauge(dd["batt_pct"], "Battery level (%)", bp["colour"]), width="stretch")
         if dd["batt_secs"] and dd["batt_secs"] > 0:
             st.metric("Est. time remaining", f"{dd['batt_secs'] / 3600:.1f} hrs")
     else:
         st.info("No battery detected — this is a desktop machine.")
     st.markdown(f"**Advice:** {bp['tip']}")
-    st.caption(f"Drain index: {bp['drain_idx']} | "
-               f"{'Est. hrs left: ' + str(bp['hrs_left']) if bp['hrs_left'] else 'Plugged in'}")
+    drain_idx = bp.get("drain_idx")
+    hrs_left = bp.get("hrs_left")
+    if drain_idx is None:
+        st.caption("Drain index: N/A | Est. hrs left: N/A")
+    else:
+        st.caption(
+            f"Drain index: {drain_idx} | "
+            f"{'Est. hrs left: ' + str(hrs_left) if hrs_left else 'Plugged in'}"
+        )
 
 
 def _render_network_panel(np_: dict) -> None:
@@ -1122,7 +1385,7 @@ def _render_network_panel(np_: dict) -> None:
     st.markdown(
         f'<div class="dcard">'
         f'<div class="dval" style="color:{np_["colour"]}">{np_["category"]} usage</div>'
-        f'<div class="dlbl">Total: {np_["total"]} GB since boot</div></div>',
+        f'<div class="dlbl">{np_["metric_label"]}</div></div>',
         unsafe_allow_html=True,
     )
     st.plotly_chart(
@@ -1133,7 +1396,7 @@ def _render_network_panel(np_: dict) -> None:
     breakdown_total = sum(breakdown_values)
     valid_breakdown = bool(np.isfinite(np.array(breakdown_values)).all() and breakdown_total > 0)
 
-    if valid_breakdown:
+    if valid_breakdown and np_.get("show_breakdown", True):
         st.plotly_chart(
             _donut(["Social / Browsing", "Streaming / Downloads", "Other"],
                    breakdown_values,
@@ -1185,7 +1448,7 @@ def _render_device_cards(dd: dict, bp: dict, np_: dict, sp: dict) -> None:
 
 
 def _render_device_relevance(dd: dict, np_: dict) -> None:
-    batt_flag = dd["batt_pct"] and dd["batt_pct"] < 20
+    batt_flag = dd.get("batt_pct") is not None and dd["batt_pct"] < 20
     net_flag = np_["total"] > 10
     cpu_flag = dd["cpu_pct"] > 70
     ram_flag = dd["ram_pct"] > 80
@@ -1198,7 +1461,7 @@ def _render_device_relevance(dd: dict, np_: dict) -> None:
         f"{'High CPU indicates heavy multitasking stress' if cpu_flag else 'Normal'} |\n"
         f"| RAM | {dd['ram_pct']}% | "
         f"{'High RAM use correlates with overloaded work sessions' if ram_flag else 'Normal'} |\n"
-        f"| Network | {np_['total']} GB | "
+        f"| Network | {np_['metric_label']} | "
         f"{'Heavy usage pattern — potential digital overuse' if net_flag else 'Moderate'} |\n"
         f"| OS | {dd['os']} / {dd['machine']} | Device context captured |"
     )
@@ -1211,61 +1474,70 @@ def page_device_predictions() -> None:
     st.markdown(
         "Device-level signals — battery drain rate, network data consumption, and screen/CPU "
         "load — are among the features the stress model uses to enrich predictions for each "
-        "age group. This page collects live readings from the host machine and applies the same "
-        "categorical thresholds the model relies on, giving you a concrete view of how physical "
-        "device behaviour connects to your digital stress profile."
+        "age group. This page now captures telemetry from the browser device currently using "
+        "the app (phone/laptop/desktop), detects its OS/platform first, then applies the same "
+        "categorical thresholds the model relies on."
     )
 
-    # Explain the mobile limitation clearly before the scan button
+    telemetry_port = _start_client_telemetry_server()
+    endpoint_base = _telemetry_endpoint_base(telemetry_port)
+    if "client_probe_token" not in st.session_state:
+        st.session_state["client_probe_token"] = uuid.uuid4().hex
+
     st.info(
-        "**Server vs client distinction.** "
-        "The scan below reads data from the machine *running this Streamlit server* using Python's "
-        "`psutil` library — not from the browser. If you are accessing this app from a mobile phone "
-        "over a local network, the stats shown will reflect the laptop or PC hosting the server, "
-        "not your phone. The browser-side panel at the bottom of this page attempts to collect "
-        "your actual device's battery and network type using browser APIs, which works regardless "
-        "of how the app is accessed.",
+        "The section below continuously syncs telemetry from the current browser session. "
+        "For mobile users, this means predictions come from the phone that opened the page."
     )
+    _render_client_probe(st.session_state["client_probe_token"], endpoint_base)
 
-    scan_btn = st.button("Scan host machine", type="primary")
+    scan_btn = st.button("Use my current device data", type="primary")
+
     if scan_btn:
-        st.session_state._loading_message = "Scanning host machine..."
+        st.session_state._loading_message = "Reading current device telemetry..."
         st.session_state._loading_until = time.time() + MIN_PAGE_LOADER_SECONDS
-        with st.spinner("Collecting device data..."):
-            st.session_state["device_data"] = collect_server_stats()
+        with st.spinner("Collecting current device data..."):
+            current = _capture_current_device_data(st.session_state["client_probe_token"])
+            if current is None:
+                st.warning(
+                    "No current-device telemetry received yet. Keep this page open for a few seconds "
+                    "and click again. Browser APIs differ by OS/browser."
+                )
+            else:
+                st.session_state["device_data"] = current
 
     if "device_data" not in st.session_state:
         st.markdown("---")
         st.markdown(
-            "Click **Scan host machine** to read live system stats and receive "
-            "battery, network, and screen load predictions. The following signals are collected:"
+            "Click **Use my current device data** to apply device predictions using the browser "
+            "device currently connected to this page. The following signals are collected when "
+            "available from browser APIs:"
         )
         st.markdown(
-            "- Battery level, charging status, estimated time remaining\n"
-            "- CPU utilisation and core count\n"
-            "- RAM usage (percentage and gigabytes)\n"
-            "- Cumulative network data sent and received since system boot\n\n"
+            "- Battery level and charging status\n"
+            "- Browser memory usage + hardware concurrency\n"
+            "- Network type and downlink throughput\n"
+            "- Platform and user-agent context\n\n"
             "All data is read locally and never transmitted anywhere."
         )
-        st.markdown("---")
-        st.markdown("**Browser-side device data (your actual device)**")
-        components.html(CLIENT_JS, height=160)
         return
 
     dd  = st.session_state["device_data"]
     bp  = _batt_prediction(dd["batt_pct"], dd["batt_plugged"], dd["cpu_pct"], dd["ram_pct"])
-    np_ = _net_prediction(dd["net_sent_gb"], dd["net_recv_gb"])
+    np_ = _net_prediction(dd)
     sp  = _screen_prediction(dd["cpu_pct"], dd["ram_pct"])
 
     st.markdown("---")
-    st.markdown("**Live host machine status**")
+    st.markdown("**Live status source: Current browser device**")
     ds1, ds2, ds3, ds4, ds5 = st.columns(5)
-    ds1.metric("Battery",    f"{dd['batt_pct']}%" if dd["batt_pct"] else "N/A",
+    ds1.metric("Battery",    f"{dd['batt_pct']}%" if dd.get("batt_pct") is not None else "N/A",
                "Charging" if dd["batt_plugged"] else "Discharging")
     ds2.metric("CPU load",   f"{dd['cpu_pct']}%")
     ds3.metric("RAM used",   f"{dd['ram_pct']}%", f"{dd['ram_used_gb']}/{dd['ram_total_gb']} GB")
-    ds4.metric("Data sent",  f"{dd['net_sent_gb']} GB")
-    ds5.metric("Data received", f"{dd['net_recv_gb']} GB")
+    ds4.metric("Data sent",  f"{dd.get('net_sent_gb', 0.0)} GB")
+    if dd.get("source") == "client" and dd.get("net_downlink_mbps") is not None:
+        ds5.metric("Downlink", f"{dd['net_downlink_mbps']} Mbps")
+    else:
+        ds5.metric("Data received", f"{dd.get('net_recv_gb', 0.0)} GB")
 
     with st.spinner("Preparing device analysis..."):
         st.markdown("---")
@@ -1276,8 +1548,7 @@ def page_device_predictions() -> None:
         _render_device_relevance(dd, np_)
 
     st.markdown("---")
-    st.markdown("**Browser-reported data (your actual device, regardless of server location)**")
-    components.html(CLIENT_JS, height=160)
+    st.caption("Telemetry is captured per connected browser session from the currently used device only.")
 
 # ---------------------------------------------------------------------------
 # Page: Project Report

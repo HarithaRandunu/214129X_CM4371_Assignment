@@ -110,7 +110,7 @@ A Streamlit application is included in `app.py` with:
 - confidence visualization and tips,
 - model performance dashboards,
 - XAI visualizations,
-- device-side telemetry panel (host + browser API context).
+- device-side telemetry panel using the **current browser device** (with optional host fallback).
 
 ---
 
